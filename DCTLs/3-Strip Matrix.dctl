@@ -1,0 +1,527 @@
+#line 2 // This line makes line numbers appear correctly in the log file
+// DCTL by Henry Bobeck
+// Technicolor3Strip v1.1s (The 's' indicates a special version for Github with exposed parameters): 
+// core linear math based on the node setup by Greg Enright (https://www.youtube.com/watch?v=YNuX6W3S94Q)
+// with added hue, sat, and lum adjustments meant to preserve original intent from input signal
+// additional math functions & spherical color model thanks to Thatcher Freeman (github.com/thatcherfreeman),
+// whose code is graciously made available under MIT License. Buy him a coffee at https://buymeacoffee.com/thatcherfreeman
+//
+// ---------- HOW TO MAKE SENSE OF THIS FILE (for those who are curious and new to DCTL coding) ----------
+// There are a lot of functions here, which can look super overwhelming if you just came to learn a bit
+// about how the DCTL works. My advice is to ignore all of it except the function at the very bottom of the
+// file called t r a n s f o r m (if I write the word without the spaces, even in a comment, the compiler
+// might get mad; welcome to the perilous world of DCTL coding). This function is called for every pixel in the
+// image, and so it's the one that drives the entire ship. From there, each function called within that function
+// is defined somewhere above it. So if you're curious about how something specific works, you can work your way
+// up to find the function you're interested in. But the basic gist of the whole process should be relatively
+// clear just by looking at that bottom function and ignoring everything else. Happy puzzling!
+// --------------------------------------------------------------------------------------------------------
+// 
+// v1.1 changelog
+// - minor system compatibility fixes
+
+// clang-format off
+DEFINE_UI_PARAMS(p_strength, Strength, DCTLUI_SLIDER_FLOAT, 0.75, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_preserve_hue, Align Skintone Hue, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_preserve_sat, Preserve Skintone Sat, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_preserve_lum, Preserve Luminance, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_clamp_outgoing_negatives, Clamp Outgoing Negatives, DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(p_working_space, Working Space, DCTLUI_COMBO_BOX, 0, { DWG_DI, DWG_LINEAR, AWG3_LOGC3, AWG4_LOGC4, AP1_ACESCC, AP1_ACESCCT, REC709_G22, REC709_G24 }, { DWG / DI, DWG / Linear, AWG3 / LogC3, AWG4 / LogC4, AP1 / ACEScc, AP1 / ACEScct, Rec709 / Gamma 2.2 INACCURATE, Rec709 / Gamma 2.4 INACCURATE})
+
+#define VER_TOOLTIPS ((__RESOLVE_VER_MAJOR__ > 19) || ((__RESOLVE_VER_MAJOR__ == 19) && (__RESOLVE_VER_MINOR__ >= 1)))
+#if (VER_TOOLTIPS)
+    DEFINE_UI_TOOLTIP(Strength, "Master strength. At 0, there is no effect.")
+    DEFINE_UI_TOOLTIP(Clamp Outgoing Negatives, "Due to the nature of the adjustment, negative values may be introduced. Enable this checkbox to clamp them to 0 on output.")
+    DEFINE_UI_TOOLTIP(Working Space, "Match this to your current working space settings as you have set up in your color management.")
+#endif
+
+#define p_auto_adjust 1
+
+#define PI 3.1415926535897932384626f
+
+#define CLAMP 1
+#define NO_CLAMP 0
+// clang-format on
+
+typedef struct {
+    float3 c0, c1, c2;
+} matrix;
+
+__CONSTANT__ matrix DWG_to_XYZ = {
+    {0.743845 ,  0.150233,  0.105922},
+    {0.276611 ,  0.870577, -0.147188},
+    {-0.091696, -0.121158,  1.212855}
+};
+__CONSTANT__ matrix AWG3_to_XYZ_BL = {
+    {0.6801393, 0.2361076, 0.0837541},
+    {0.2960160, 0.8266239, -0.1226395},
+    {0.0020570, -0.0625630, 1.0605060}
+};
+__CONSTANT__ matrix AWG4_to_XYZ =  {
+    {0.704858, 0.129760, 0.115837},
+    {0.254524, 0.781478, -0.036002},
+    {0.000000, 0.000000, 1.089058}
+};
+__CONSTANT__ matrix REC709_to_XYZ =  {
+    {0.412391, 0.357584, 0.180481},
+    {0.212639, 0.715169, 0.072192},
+    {0.019331, 0.119195, 0.950532}
+};
+__CONSTANT__ matrix AP0_to_DWG =  {
+    {1.32832312, -0.21352364, -0.11479948},
+    {-0.01316075, 0.91286542, 0.10029534},
+    {0.09831923, 0.07961846, 0.82206231}
+};
+__CONSTANT__ matrix AP1_to_XYZ =  {
+    {0.6624541811, 0.1340042065, 0.1561876870},
+    {0.2722287168, 0.6740817658, 0.0536895174},
+    {-0.0055746495, 0.0040607335, 1.0103391003}
+};
+
+__DEVICE__ float calculate_lum(float3 rgb) {
+    // Rec.601 luminance coefficients
+    float3 lum_coefficients = make_float3(0.29912f, 0.58749f, 0.11437f); 
+
+    return lum_coefficients.x * rgb.x + lum_coefficients.y * rgb.y + lum_coefficients.z * rgb.z;
+}
+
+__DEVICE__ float clamp_max(float value, float max) {
+    return value > max ? max : value;
+}
+
+__DEVICE__ float clamp_min_to_0(float value) {
+    return value < 0.0 ? 0.0 : value;
+}
+
+__DEVICE__ float3 cross_product(float3 a, float3 b) {
+    float3 out = make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+    return out;
+}
+
+__DEVICE__ inline float pow2f(float base) {
+    return base * base;
+}
+
+__DEVICE__ float powf(float base, float exp) {
+    return _copysignf(_powf(_fabs(base), exp), base);
+}
+
+// tanf (_tanf causes problems in some AMD systems)
+__DEVICE__ float tanf(float x) {
+    float tan = _sinf(x) / _cosf(x);
+    return tan;
+}
+
+__DEVICE__ float di_to_linear(float in) {
+    float out = in > .02740668 ? powf(2.f, (in / .07329248f) - 7.f) - .0075f : in / 10.44426855f;
+    return out;
+}
+__DEVICE__ float linear_to_di(float in) {
+    float out = in > .00262409f ? (_log2f(in + .0075f) + 7.f) * .07329248f : in * 10.44426855f;
+    return out;
+}
+__DEVICE__ float logc3_to_linear(float in) {
+    float out = in > 0.1496582f ? (powf(10.0f, (in - 0.385537f) / 0.2471896f) - 0.052272f) / 5.555556f : (in - 0.092809f) / 5.367655f;
+    return out;
+}
+__DEVICE__ float linear_to_logc3(float in) {
+    float out = in > 0.010591f ? 0.24719f * _log10f(5.555556f * in + 0.052272f) + 0.385537f : 5.367655f * in + 0.092809f;
+    return out;
+}
+__DEVICE__ float logc4_to_linear(float x) {
+    const float a = (powf(2.0f, 18.0f) - 16.0f) / 117.45f;
+    const float b = (1023.0f - 95.0f) / 1023.0f;
+    const float c = 95.0f / 1023.0f;
+    const float s = (7 * _log10f(2.0f) * powf(2.0, 7 - 14 * c / b)) / (a * b);
+    const float t = (powf(2.0f, 14.0f * (-c / b) + 6.0) - 64.0) / a;
+
+    if (x < 0.0) {
+        return x * s + t;
+    }
+    float p = 14.0f * (x - c) / b + 6.0f;
+    return (powf(2.0f, p) - 64.0f) / a;
+}
+__DEVICE__ float linear_to_logc4(float x) {
+    const float a = (powf(2.0f, 18.0f) - 16.0f) / 117.45f;
+    const float b = (1023.0f - 95.0f) / 1023.0f;
+    const float c = 95.0 / 1023.0f;
+    const float s = (7 * _log10f(2.0f) * powf(2.0f, 7 - 14 * c / b)) / (a * b);
+    const float t = (powf(2.0f, 14.0f * (-c / b) + 6.0f) - 64.0f) / a;
+
+    if (x < t) {
+        return (x - t) / s;
+    }
+    return (_log2f( a * x + 64.0) - 6.0) / 14.0 * b + c;
+}
+__DEVICE__ float acescc_to_linear(float in) {
+    if (in < -0.3013698630f) { // (9.72-15)/17.52
+        return (_exp2f(in * 17.52f - 9.72f) - _exp2f(-16.0f)) * 2.0f;
+    } else {
+        return _exp2f(in * 17.52f - 9.72f);
+    }
+}
+__DEVICE__ float linear_to_acescc(float in) {
+    if (in <= 0.0f) {
+        return -0.3584474886f; // =(log2( pow(2.,-16.))+9.72)/17.52
+    } else if (in < _exp2f(-15.0f)) {
+        return (_log2f(_exp2f(-16.0f) + in * 0.5f) + 9.72f) / 17.52f;
+    } else {
+        return (_log2f(in) + 9.72f) / 17.52f;
+    }
+}
+__DEVICE__ float acescct_to_linear(float in) {
+    const float X_BRK = 0.0078125f;
+    const float Y_BRK = 0.155251141552511f;
+    const float A = 10.5402377416545f;
+    const float B = 0.0729055341958355f;
+    if (in > Y_BRK)
+        return _exp2f(in * 17.52f - 9.72f);
+    else
+        return (in - B) / A;
+}
+__DEVICE__ float linear_to_acescct(float in) {
+    const float X_BRK = 0.0078125f;
+    const float Y_BRK = 0.155251141552511f;
+    const float A = 10.5402377416545f;
+    const float B = 0.0729055341958355f;
+    if (in <= X_BRK) {
+        return A * in + B;
+    } else { // (in > X_BRK)
+        return (_log2f(in) + 9.72f) / 17.52f;
+    }
+}
+
+__DEVICE__ float3 apply_matrix(float3 in, matrix mat, int clamp)
+{
+    float3 out;
+    out.x = mat.c0.x * in.x + mat.c0.y * in.y + mat.c0.z*in.z;
+    out.y = mat.c1.x * in.x + mat.c1.y * in.y + mat.c1.z *in.z;
+    out.z = mat.c2.x * in.x + mat.c2.y * in.y + mat.c2.z * in.z;
+    out.x = clamp == 1 ? _fmaxf(out.x, 0.0f) : out.x;
+    out.y = clamp == 1 ? _fmaxf(out.y, 0.0f) : out.y;
+    out.z = clamp == 1 ? _fmaxf(out.z, 0.0f) : out.z;
+    return out;
+}
+__DEVICE__ float3 apply_matrix_inv(float3 in, matrix mat, int clamp)
+{
+    float3 out;
+    float mat_fwd[3][3] = 
+    {
+        {mat.c0.x, mat.c0.y, mat.c0.z},
+        {mat.c1.x, mat.c1.y, mat.c1.z},
+        {mat.c2.x, mat.c2.y, mat.c2.z},
+    };
+    float mat_inv[3][3];
+    float det = mat_fwd[0][0] * mat_fwd[1][1] * mat_fwd[2][2] + mat_fwd[0][1] * mat_fwd[1][2] * mat_fwd[2][0] + mat_fwd[0][2] * mat_fwd[1][0] * mat_fwd[2][1] - mat_fwd[2][0] * mat_fwd[1][1] * mat_fwd[0][2] - mat_fwd[2][1] * mat_fwd[1][2] * mat_fwd[0][0] - mat_fwd[2][2] * mat_fwd[1][0] * mat_fwd[0][1];
+    float inv_det = 1.f / det;
+    if( det != 0.0f ){
+            mat_inv[0][0] = mat_fwd[1][1] * mat_fwd[2][2] - mat_fwd[1][2] * mat_fwd[2][1]; 
+            mat_inv[0][1] = mat_fwd[2][1] * mat_fwd[0][2] - mat_fwd[2][2] * mat_fwd[0][1];
+            mat_inv[0][2] = mat_fwd[0][1] * mat_fwd[1][2] - mat_fwd[0][2] * mat_fwd[1][1]; 
+            mat_inv[1][0] = mat_fwd[2][0] * mat_fwd[1][2] - mat_fwd[1][0] * mat_fwd[2][2];
+            mat_inv[1][1] = mat_fwd[0][0] * mat_fwd[2][2] - mat_fwd[2][0] * mat_fwd[0][2]; 
+            mat_inv[1][2] = mat_fwd[1][0] * mat_fwd[0][2] - mat_fwd[0][0] * mat_fwd[1][2];
+            mat_inv[2][0] = mat_fwd[1][0] * mat_fwd[2][1] - mat_fwd[2][0] * mat_fwd[1][1]; 
+            mat_inv[2][1] = mat_fwd[2][0] * mat_fwd[0][1] - mat_fwd[0][0] * mat_fwd[2][1];
+            mat_inv[2][2] = mat_fwd[0][0] * mat_fwd[1][1] - mat_fwd[1][0] * mat_fwd[0][1];
+            matrix mat_out =
+            {
+                {mat_inv[0][0] * inv_det, mat_inv[0][1] * inv_det, mat_inv[0][2] * inv_det},
+                {mat_inv[1][0] * inv_det, mat_inv[1][1] * inv_det, mat_inv[1][2] * inv_det},
+                {mat_inv[2][0] * inv_det, mat_inv[2][1] * inv_det, mat_inv[2][2] * inv_det},
+            };  
+                      
+            float R = in.x;
+            float G = in.y;
+            float B = in.z;
+            out.x = R * mat_out.c0.x + G * mat_out.c0.y + B * mat_out.c0.z;
+            out.y = R * mat_out.c1.x + G * mat_out.c1.y + B * mat_out.c1.z;
+            out.z = R * mat_out.c2.x + G * mat_out.c2.y + B * mat_out.c2.z;
+    
+            out.x = clamp == 1 ? _fmaxf(out.x, 0.0f) : out.x;
+            out.y = clamp == 1 ? _fmaxf(out.y, 0.0f) : out.y;
+            out.z = clamp == 1 ? _fmaxf(out.z, 0.0f) : out.z;
+            return out;
+        }
+    else {
+        return in;
+    }
+}
+
+__DEVICE__ float gamma_curve(float x, float gamma) {
+    return gamma != 0.0f ? powf(x, 1.0f/gamma) : 0.0f;
+}
+
+__DEVICE__ float dot_product(float3 a, float3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__DEVICE__ float norm_f3(float3 a) {
+    return _sqrtf(pow2f(a.x) + pow2f(a.y) + pow2f(a.z));
+}
+
+__DEVICE__ float3 unit_vec(float3 a) {
+    float norm = norm_f3(a);
+    float3 out = make_float3(a.x / norm, a.y / norm, a.z / norm);
+    return out;
+}
+
+__DEVICE__ float3 mv_33_3(float mat[3][3], float3 v) {
+    float3 out = make_float3(mat[0][0] * v.x + mat[0][1] * v.y + mat[0][2] * v.z,
+                             mat[1][0] * v.x + mat[1][1] * v.y + mat[1][2] * v.z,
+                             mat[2][0] * v.x + mat[2][1] * v.y + mat[2][2] * v.z);
+    return out;
+}
+
+__DEVICE__ float mod(float x, float y) {
+    if (x < 0) {
+        return y + _fmod(x, y);
+    } else {
+        return _fmod(x, y);
+    }
+}
+
+__DEVICE__ void make_rotation_mat_axis_angle(float mat[3][3], float3 axis, float angle) {
+    // Axis assumed to be unit vector, angle assuemd to be in radians
+    float c = _cosf(angle);
+    float s = _sinf(angle);
+
+    mat[0][0] = c + pow2f(axis.x) * (1.0 - c);
+    mat[0][1] = axis.x * axis.y * (1.0 - c) - axis.z * s;
+    mat[0][2] = axis.x * axis.z * (1.0 - c) + axis.y * s;
+    mat[1][0] = axis.x * axis.y * (1.0 - c) + axis.z * s;
+    mat[1][1] = c + pow2f(axis.y) * (1.0 - c);
+    mat[1][2] = axis.y * axis.z * (1.0 - c) - axis.x * s;
+    mat[2][0] = axis.z * axis.x * (1.0 - c) - axis.y * s;
+    mat[2][1] = axis.z * axis.y * (1.0 - c) + axis.x * s;
+    mat[2][2] = c + pow2f(axis.z) * (1.0 - c);
+}
+
+__DEVICE__ float3 rgb_to_spherical(float3 x) {
+    // Returns hue, scaled 0-1
+    const float3 achromatic = make_float3(1.0, 1.0, 1.0);
+    const float3 red_axis = make_float3(1.0, 0.0, 0.0);
+    float rot_mat[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+    float rot_mat2[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+
+    // Moves the achromatic axis to the red axis.
+    make_rotation_mat_axis_angle(
+        rot_mat, unit_vec(cross_product(red_axis, achromatic)), -1.0 * _acosf(dot_product(red_axis, unit_vec(achromatic))));
+    // Rotates around (1, 0, 0) so that the old red vector points to (0, 1, 0).
+    make_rotation_mat_axis_angle(rot_mat2, red_axis, 3.0 * PI / 4.0);
+
+    float3 rotated_color = mv_33_3(rot_mat, x);
+    rotated_color = mv_33_3(rot_mat2, rotated_color);
+    float theta = _atan2f(rotated_color.z, rotated_color.y);
+
+    float value = norm_f3(rotated_color);
+    float hue = mod(theta, 2.0 * PI);
+    float sat = _atan2f(norm_f3(make_float3(rotated_color.y, rotated_color.z, 0.0)), rotated_color.x);
+
+    if (_fabs(sat - PI) < 1e-5) {
+        hue = 0.0;
+    }
+
+    return make_float3(hue / (2.0 * PI), sat, value);
+}
+
+__DEVICE__ float3 spherical_to_rgb(float3 in) {
+    // Expects hue to be in range 0-1
+    const float3 achromatic = make_float3(1.0, 1.0, 1.0);
+    const float3 red_axis = make_float3(1.0, 0.0, 0.0);
+
+    float rot_mat_inv[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+    float rot_mat2_inv[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+    make_rotation_mat_axis_angle(
+        rot_mat_inv, unit_vec(cross_product(red_axis, achromatic)), _acosf(dot_product(red_axis, unit_vec(achromatic))));
+    make_rotation_mat_axis_angle(rot_mat2_inv, red_axis, -3.0 * PI / 4.0);
+
+    float hue = mod(in.x * 2.0 * PI, 2.0 * PI);
+    float sat = in.y;
+    float value = in.z;
+
+    float3 direction = make_float3(1.0, 1.0, 1.0);
+    direction.x = value * _cosf(sat);
+    direction.z = value * _sinf(hue) * _sinf(sat);
+    direction.y = value * _cosf(hue) * _sinf(sat);
+
+    float3 x = mv_33_3(rot_mat2_inv, direction);
+    x = mv_33_3(rot_mat_inv, x);
+    return x;
+}
+
+// CST
+// rgb : float3
+// input : int representing one of the color spaces (expected to use a struct)
+// output : int representing one of the color spaces (expected to use a struct)
+__DEVICE__ float3 cst(float3 rgb, int input, int output) {
+    // Skip if trivial
+    if (input == output) return rgb;
+
+    // Convert input to XYZ / linear
+    switch (input) {
+        case DWG_DI:
+            rgb.x = di_to_linear(rgb.x);
+            rgb.y = di_to_linear(rgb.y);
+            rgb.z = di_to_linear(rgb.z);
+            rgb = apply_matrix(rgb, DWG_to_XYZ, NO_CLAMP);
+            break;
+        case DWG_LINEAR:
+            rgb = apply_matrix(rgb, DWG_to_XYZ, NO_CLAMP);
+            break;
+        case AWG3_LOGC3:
+            rgb.x = logc3_to_linear(rgb.x);
+            rgb.y = logc3_to_linear(rgb.y);
+            rgb.z = logc3_to_linear(rgb.z);
+            rgb = apply_matrix(rgb, AWG3_to_XYZ_BL, NO_CLAMP);
+            break;
+        case AWG4_LOGC4:
+            rgb.x = logc4_to_linear(rgb.x);
+            rgb.y = logc4_to_linear(rgb.y);
+            rgb.z = logc4_to_linear(rgb.z);
+            rgb = apply_matrix(rgb, AWG4_to_XYZ, NO_CLAMP);
+            break;
+        case AP1_ACESCC:
+            rgb.x = acescc_to_linear(rgb.x);
+            rgb.y = acescc_to_linear(rgb.y);
+            rgb.z = acescc_to_linear(rgb.z);
+            rgb = apply_matrix(rgb, AP1_to_XYZ, NO_CLAMP);
+            break;
+        case AP1_ACESCCT:
+            rgb.x = acescct_to_linear(rgb.x);
+            rgb.y = acescct_to_linear(rgb.y);
+            rgb.z = acescct_to_linear(rgb.z);
+            rgb = apply_matrix(rgb, AP1_to_XYZ, NO_CLAMP);
+            break;
+        case REC709_G22:
+            rgb.x = gamma_curve(rgb.x, 1.0/2.2);
+            rgb.y = gamma_curve(rgb.y, 1.0/2.2);
+            rgb.z = gamma_curve(rgb.z, 1.0/2.2);
+            rgb = apply_matrix(rgb, REC709_to_XYZ, NO_CLAMP);
+            break;
+        case REC709_G24:
+            rgb.x = gamma_curve(rgb.x, 1.0/2.4);
+            rgb.y = gamma_curve(rgb.y, 1.0/2.4);
+            rgb.z = gamma_curve(rgb.z, 1.0/2.4);
+            rgb = apply_matrix(rgb, REC709_to_XYZ, NO_CLAMP);
+            break;
+    }
+    
+    // Convert linear to output
+    switch (output) {
+        case DWG_DI:
+            rgb = apply_matrix_inv(rgb, DWG_to_XYZ, NO_CLAMP);
+            rgb.x = linear_to_di(rgb.x);
+            rgb.y = linear_to_di(rgb.y);
+            rgb.z = linear_to_di(rgb.z);
+            break;
+        case DWG_LINEAR:
+            rgb = apply_matrix_inv(rgb, DWG_to_XYZ, NO_CLAMP);
+            break;
+        case AWG3_LOGC3:
+            rgb = apply_matrix_inv(rgb, AWG3_to_XYZ_BL, NO_CLAMP);
+            rgb.x = linear_to_logc3(rgb.x);
+            rgb.y = linear_to_logc3(rgb.y);
+            rgb.z = linear_to_logc3(rgb.z);
+            break;
+        case AWG4_LOGC4:
+            rgb = apply_matrix_inv(rgb, AWG4_to_XYZ, NO_CLAMP);
+            rgb.x = linear_to_logc4(rgb.x);
+            rgb.y = linear_to_logc4(rgb.y);
+            rgb.z = linear_to_logc4(rgb.z);
+            break;
+        case AP1_ACESCC:
+            rgb = apply_matrix_inv(rgb, AP1_to_XYZ, NO_CLAMP);
+            rgb.x = linear_to_acescc(rgb.x);
+            rgb.y = linear_to_acescc(rgb.y);
+            rgb.z = linear_to_acescc(rgb.z);
+            break;
+        case AP1_ACESCCT:
+            rgb = apply_matrix_inv(rgb, AP1_to_XYZ, NO_CLAMP);
+            rgb.x = linear_to_acescct(rgb.x);
+            rgb.y = linear_to_acescct(rgb.y);
+            rgb.z = linear_to_acescct(rgb.z);
+            break;
+        case REC709_G22:
+            rgb = apply_matrix_inv(rgb, REC709_to_XYZ, NO_CLAMP);
+            rgb.x = gamma_curve(rgb.x, 2.2);
+            rgb.y = gamma_curve(rgb.y, 2.2);
+            rgb.z = gamma_curve(rgb.z, 2.2);
+            break;
+        case REC709_G24:
+            rgb = apply_matrix_inv(rgb, REC709_to_XYZ, NO_CLAMP);
+            rgb.x = gamma_curve(rgb.x, 2.4);
+            rgb.y = gamma_curve(rgb.y, 2.4);
+            rgb.z = gamma_curve(rgb.z, 2.4);
+            break;
+    }
+    
+    return rgb;
+}
+
+// The function that gets called for every pixel. If you're trying to understand the DCTL, start here!
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    // Save the inital rgb values for later use
+    float3 in_rgb = make_float3(p_R, p_G, p_B); 
+    // convert from user's Working Space to DWG/DI
+    float3 in_rgb_dwg = cst(in_rgb, p_working_space, DWG_DI);
+    // we'll make our adjustments to this variable
+    float3 ws = in_rgb_dwg;
+
+    // 3-strip inspired crosstalk (base of the look)
+    float r = ws.x;
+    float g = ws.y;
+    float b = ws.z;
+    float str = 0.75f;
+    ws.x = (r - str*g + str*b);
+    ws.y = (g - str*r + str*b);
+    ws.z = (b - str*r + str*g);
+
+    // custom adjustments
+    if (p_preserve_hue > 0.0f || p_preserve_sat > 0.0f) {
+       
+        // clamp negatives at this point to avoid introducing artifacts during spherical adjustments
+        ws = make_float3(clamp_min_to_0(ws.x), clamp_min_to_0(ws.y), clamp_min_to_0(ws.z));
+
+        // convert to spherical opponent space to apply hue/sat adjustments
+        ws = rgb_to_spherical(ws);
+        // hue rotate to align skintones
+        float3 ws_pres_hue = ws;
+        ws_pres_hue.x += 0.03f;
+        ws = p_preserve_hue*ws_pres_hue + (1-p_preserve_hue)*ws;
+        // sat gamma+gain to preserve original overall perceptual saturation to taste
+        float3 ws_pres_sat = ws;
+        float sat_gain = 0.6f;
+        float sat_gamma = 1.08f;
+        ws_pres_sat.y = powf(sat_gain * ws_pres_sat.y, 1.0f / sat_gamma);
+        ws = p_preserve_sat*ws_pres_sat + (1-p_preserve_sat)*ws;
+
+
+        ws = spherical_to_rgb(ws);
+    }
+
+    // lum preservation
+    if (p_preserve_lum > 0) {
+        float lum_delta = calculate_lum(ws) - calculate_lum(in_rgb_dwg);
+        float3 ws_pres_lum = ws - lum_delta;
+
+        ws = p_preserve_lum*ws_pres_lum + (1-p_preserve_lum)*ws;
+    }
+
+    // convert back to user's Working Space
+    ws = cst(ws, DWG_DI, p_working_space);
+
+    // blend with starting values based on strength    
+    ws = p_strength*ws + (1.0f-p_strength)*in_rgb;
+    
+    float3 out = ws;
+
+    // clamp outgoing negatives
+    if (p_clamp_outgoing_negatives) {
+        out = make_float3(clamp_min_to_0(out.x), clamp_min_to_0(out.y), clamp_min_to_0(out.z));
+    }
+
+    // Output the final result
+    return out;
+}
