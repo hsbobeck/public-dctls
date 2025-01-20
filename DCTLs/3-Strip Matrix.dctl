@@ -17,8 +17,9 @@
 // clear just by looking at that bottom function and ignoring everything else. Happy puzzling!
 // --------------------------------------------------------------------------------------------------------
 // 
-// v1.1 changelog
-// - minor system compatibility fixes
+// v1.1s changelog (from v1.1)
+// - exposed internal parameters for blending custom hue, sat, and lum adjustments to taste
+// - added options for outputting the r, g, b channels individually
 
 // clang-format off
 DEFINE_UI_PARAMS(p_strength, Strength, DCTLUI_SLIDER_FLOAT, 0.75, 0.0, 1.0, 0.001)
@@ -27,6 +28,7 @@ DEFINE_UI_PARAMS(p_preserve_sat, Preserve Skintone Sat, DCTLUI_SLIDER_FLOAT, 1.0
 DEFINE_UI_PARAMS(p_preserve_lum, Preserve Luminance, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.001)
 DEFINE_UI_PARAMS(p_clamp_outgoing_negatives, Clamp Outgoing Negatives, DCTLUI_CHECK_BOX, 1)
 DEFINE_UI_PARAMS(p_working_space, Working Space, DCTLUI_COMBO_BOX, 0, { DWG_DI, DWG_LINEAR, AWG3_LOGC3, AWG4_LOGC4, AP1_ACESCC, AP1_ACESCCT, REC709_G22, REC709_G24 }, { DWG / DI, DWG / Linear, AWG3 / LogC3, AWG4 / LogC4, AP1 / ACEScc, AP1 / ACEScct, Rec709 / Gamma 2.2 INACCURATE, Rec709 / Gamma 2.4 INACCURATE})
+DEFINE_UI_PARAMS(p_output, Output, DCTLUI_COMBO_BOX, 0, { ALL, RED_ONLY, GREEN_ONLY, BLUE_ONLY }, { All, Red Only, Green Only, Blue Only })
 
 #define VER_TOOLTIPS ((__RESOLVE_VER_MAJOR__ > 19) || ((__RESOLVE_VER_MAJOR__ == 19) && (__RESOLVE_VER_MINOR__ >= 1)))
 #if (VER_TOOLTIPS)
@@ -520,6 +522,13 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
     // clamp outgoing negatives
     if (p_clamp_outgoing_negatives) {
         out = make_float3(clamp_min_to_0(out.x), clamp_min_to_0(out.y), clamp_min_to_0(out.z));
+    }
+
+    switch(p_output) {
+        case ALL: break;
+        case RED_ONLY: out = make_float3(out.x, 0, 0); break;
+        case GREEN_ONLY: out = make_float3(0, out.y, 0); break;
+        case BLUE_ONLY: out = make_float3(0, 0, out.z); break;
     }
 
     // Output the final result
